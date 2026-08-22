@@ -1,0 +1,119 @@
+name: Build J2TEAM Security Safari iOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show repository
+        run: |
+          echo "Repository:"
+          pwd
+          find . -maxdepth 2 -type f -print
+
+      - name: Prepare workspace
+        run: |
+          rm -rf build
+          mkdir -p build/extension
+
+      - name: Extract J2TEAM Security
+        run: |
+          unzip -q J2TEAM-Security-2.4.2-source.zip -d build
+
+          if [ -d "build/source" ]; then
+            cp -R build/source/. build/extension/
+          else
+            echo "ERROR: source directory not found"
+            exit 1
+          fi
+
+      - name: Verify extension
+        run: |
+          echo "Manifest:"
+          cat build/extension/manifest.json
+
+          echo
+          echo "Extension files:"
+          find build/extension -type f | sort
+
+      - name: Create Safari iOS project
+        run: |
+          mkdir -p build/safari
+
+          xcrun safari-web-extension-packager \
+            build/extension \
+            --ios-only \
+            --copy-resources \
+            --app-name "J2TEAM Security" \
+            --bundle-identifier "com.coumarin.j2teamsecurity" \
+            --swift \
+            --project-location build/safari \
+            --no-open \
+            --no-prompt \
+            --force
+
+      - name: Inspect generated project
+        run: |
+          echo "Generated project:"
+          find build/safari -maxdepth 4 -type f | sort
+
+      - name: Find Xcode project
+        id: project
+        shell: bash
+        run: |
+          PROJECT=$(find build/safari -maxdepth 3 -name "*.xcodeproj" -print -quit)
+
+          if [ -z "$PROJECT" ]; then
+            echo "ERROR: No Xcode project generated"
+            exit 1
+          fi
+
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+          echo "Found: $PROJECT"
+
+      - name: Show schemes
+        run: |
+          xcodebuild \
+            -project "${{ steps.project.outputs.project }}" \
+            -list
+
+      - name: Build iOS project
+        run: |
+          mkdir -p build/archive
+
+          xcodebuild \
+            -project "${{ steps.project.outputs.project }}" \
+            -scheme "J2TEAM Security (iOS)" \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath "$PWD/build/archive/J2TEAM-Security.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            archive
+
+      - name: Export build information
+        if: always()
+        run: |
+          echo "=== BUILD DIRECTORY ==="
+          find build -maxdepth 5 -type f | sort || true
+
+      - name: Upload Safari project
+        uses: actions/upload-artifact@v4
+        with:
+          name: J2TEAM-Safari-iOS-project
+          path: build/safari/
+
+      - name: Upload archive
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: J2TEAM-Security-iOS-archive
+          path: build/archive/
