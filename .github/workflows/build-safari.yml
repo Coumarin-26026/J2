@@ -4,49 +4,132 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
+    name: Build Safari iOS Extension
     runs-on: macos-latest
 
     steps:
+      # ------------------------------------------------------------
+      # 1. Checkout
+      # ------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show repository
+      # ------------------------------------------------------------
+      # 2. Check source ZIP
+      # ------------------------------------------------------------
+      - name: Check source archive
+        shell: bash
         run: |
-          echo "Repository:"
-          pwd
-          find . -maxdepth 2 -type f -print
+          set -euo pipefail
 
-      - name: Prepare workspace
-        run: |
-          rm -rf build
-          mkdir -p build/extension
+          ZIP="J2TEAM-Security-2.4.2-source.zip"
 
-      - name: Extract J2TEAM Security
-        run: |
-          unzip -q J2TEAM-Security-2.4.2-source.zip -d build
-
-          if [ -d "build/source" ]; then
-            cp -R build/source/. build/extension/
-          else
-            echo "ERROR: source directory not found"
+          if [ ! -f "$ZIP" ]; then
+            echo "::error::Source ZIP not found: $ZIP"
             exit 1
           fi
 
-      - name: Verify extension
+          echo "Source archive:"
+          ls -lh "$ZIP"
+
+      # ------------------------------------------------------------
+      # 3. Prepare build directory
+      # ------------------------------------------------------------
+      - name: Prepare build directory
+        shell: bash
         run: |
-          echo "Manifest:"
-          cat build/extension/manifest.json
+          set -euo pipefail
+
+          rm -rf build
+          mkdir -p build/extension
+          mkdir -p build/safari
+          mkdir -p build/archive
+
+      # ------------------------------------------------------------
+      # 4. Extract J2TEAM Security 2.4.2
+      # ------------------------------------------------------------
+      - name: Extract J2TEAM Security
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          unzip -q \
+            J2TEAM-Security-2.4.2-source.zip \
+            -d build/extracted
+
+          if [ ! -d "build/extracted/source" ]; then
+            echo "::error::source directory was not found in ZIP"
+            find build/extracted -maxdepth 3 -print
+            exit 1
+          fi
+
+          cp -R \
+            build/extracted/source/. \
+            build/extension/
+
+          echo "Extension extracted successfully."
+
+      # ------------------------------------------------------------
+      # 5. Verify manifest
+      # ------------------------------------------------------------
+      - name: Verify J2TEAM manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MANIFEST="build/extension/manifest.json"
+
+          if [ ! -f "$MANIFEST" ]; then
+            echo "::error::manifest.json not found"
+            exit 1
+          fi
+
+          echo "=== manifest.json ==="
+          cat "$MANIFEST"
 
           echo
-          echo "Extension files:"
-          find build/extension -type f | sort
+          echo "=== Version ==="
 
-      - name: Create Safari iOS project
+          /usr/bin/python3 - <<'PY'
+          import json
+
+          path = "build/extension/manifest.json"
+
+          with open(path, "r", encoding="utf-8") as f:
+              manifest = json.load(f)
+
+          print("Name:", manifest.get("name"))
+          print("Version:", manifest.get("version"))
+          print("Manifest:", manifest.get("manifest_version"))
+          PY
+
+      # ------------------------------------------------------------
+      # 6. Show Xcode / Safari packager
+      # ------------------------------------------------------------
+      - name: Check Xcode tools
+        shell: bash
         run: |
+          set -euo pipefail
+
+          xcodebuild -version
+
+          echo
+          echo "Safari Web Extension Packager:"
+          xcrun --find safari-web-extension-packager
+
+      # ------------------------------------------------------------
+      # 7. Package Safari Web Extension
+      # ------------------------------------------------------------
+      - name: Package Safari iOS extension
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf build/safari
           mkdir -p build/safari
 
           xcrun safari-web-extension-packager \
@@ -61,59 +144,233 @@ jobs:
             --no-prompt \
             --force
 
-      - name: Inspect generated project
-        run: |
-          echo "Generated project:"
-          find build/safari -maxdepth 4 -type f | sort
-
-      - name: Find Xcode project
+      # ------------------------------------------------------------
+      # 8. Locate generated Xcode project
+      # ------------------------------------------------------------
+      - name: Locate generated Xcode project
         id: project
         shell: bash
         run: |
-          PROJECT=$(find build/safari -maxdepth 3 -name "*.xcodeproj" -print -quit)
+          set -euo pipefail
 
-          if [ -z "$PROJECT" ]; then
-            echo "ERROR: No Xcode project generated"
+          echo "=== Generated files ==="
+          find build/safari -maxdepth 5 -print | sort
+
+          echo
+          echo "=== Xcode projects ==="
+
+          mapfile -t PROJECTS < <(
+            find build/safari \
+              -name "*.xcodeproj" \
+              -type d \
+              -print
+          )
+
+          if [ "${#PROJECTS[@]}" -eq 0 ]; then
+            echo "::error::No Xcode project was generated."
             exit 1
           fi
 
-          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
-          echo "Found: $PROJECT"
+          if [ "${#PROJECTS[@]}" -gt 1 ]; then
+            echo "Multiple Xcode projects found:"
+            printf '%s\n' "${PROJECTS[@]}"
+          fi
 
-      - name: Show schemes
+          PROJECT="${PROJECTS[0]}"
+
+          echo
+          echo "Using project:"
+          echo "$PROJECT"
+
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------
+      # 9. List actual targets and schemes
+      # ------------------------------------------------------------
+      - name: Inspect Xcode project
+        id: inspect
+        shell: bash
         run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.project.outputs.project }}"
+
+          echo "=== Xcode project ==="
+          echo "$PROJECT"
+
+          echo
+          echo "=== xcodebuild -list ==="
+
           xcodebuild \
-            -project "${{ steps.project.outputs.project }}" \
+            -project "$PROJECT" \
             -list
 
-      - name: Build iOS project
+      # ------------------------------------------------------------
+      # 10. Detect scheme automatically
+      # ------------------------------------------------------------
+      - name: Detect iOS scheme
+        id: scheme
+        shell: bash
         run: |
-          mkdir -p build/archive
+          set -euo pipefail
+
+          PROJECT="${{ steps.project.outputs.project }}"
+
+          echo "Reading schemes from:"
+          echo "$PROJECT"
+
+          LIST="$(
+            xcodebuild \
+              -project "$PROJECT" \
+              -list 2>&1
+          )"
+
+          echo
+          echo "=== xcodebuild output ==="
+          echo "$LIST"
+
+          echo
+          echo "=== Detecting schemes ==="
+
+          SCHEMES="$(
+            printf '%s\n' "$LIST" |
+            awk '
+              /^Schemes:/ {
+                in_schemes=1
+                next
+              }
+
+              in_schemes && /^[[:space:]]*$/ {
+                exit
+              }
+
+              in_schemes {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+                if ($0 != "")
+                  print
+              }
+            '
+          )"
+
+          echo "$SCHEMES"
+
+          if [ -z "$SCHEMES" ]; then
+            echo "::error::No Xcode schemes were found."
+            exit 1
+          fi
+
+          # Prefer a scheme containing Safari/J2TEAM/iOS.
+          SCHEME="$(
+            printf '%s\n' "$SCHEMES" |
+            grep -Ei 'safari|j2team|ios' |
+            head -n 1 ||
+            true
+          )"
+
+          # If no preferred scheme exists, use the first scheme.
+          if [ -z "$SCHEME" ]; then
+            SCHEME="$(
+              printf '%s\n' "$SCHEMES" |
+              head -n 1
+            )"
+          fi
+
+          SCHEME="$(printf '%s' "$SCHEME" | xargs)"
+
+          if [ -z "$SCHEME" ]; then
+            echo "::error::Failed to determine Xcode scheme."
+            exit 1
+          fi
+
+          echo
+          echo "======================================"
+          echo "Selected scheme:"
+          echo "$SCHEME"
+          echo "======================================"
+
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------
+      # 11. Build without signing
+      # ------------------------------------------------------------
+      - name: Build iOS archive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.project.outputs.project }}"
+          SCHEME="${{ steps.scheme.outputs.scheme }}"
+
+          ARCHIVE="$PWD/build/archive/J2TEAM-Security.xcarchive"
+
+          echo "Project:"
+          echo "$PROJECT"
+
+          echo
+          echo "Scheme:"
+          echo "$SCHEME"
+
+          echo
+          echo "Archive:"
+          echo "$ARCHIVE"
+
+          rm -rf "$ARCHIVE"
 
           xcodebuild \
-            -project "${{ steps.project.outputs.project }}" \
-            -scheme "J2TEAM Security (iOS)" \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
             -configuration Release \
             -sdk iphoneos \
-            -archivePath "$PWD/build/archive/J2TEAM-Security.xcarchive" \
+            -archivePath "$ARCHIVE" \
             CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
             archive
 
-      - name: Export build information
+      # ------------------------------------------------------------
+      # 12. Inspect archive
+      # ------------------------------------------------------------
+      - name: Inspect archive
         if: always()
+        shell: bash
         run: |
-          echo "=== BUILD DIRECTORY ==="
-          find build -maxdepth 5 -type f | sort || true
+          echo "=== Build directory ==="
+          find build -maxdepth 6 -print | sort
 
+          echo
+          echo "=== Archive ==="
+
+          if [ -d "build/archive/J2TEAM-Security.xcarchive" ]; then
+            ls -lah \
+              build/archive/J2TEAM-Security.xcarchive
+
+            echo
+            echo "Archive products:"
+            find \
+              build/archive/J2TEAM-Security.xcarchive/Products \
+              -maxdepth 5 \
+              -print 2>/dev/null || true
+          else
+            echo "Archive was not created."
+          fi
+
+      # ------------------------------------------------------------
+      # 13. Upload Safari Xcode project
+      # ------------------------------------------------------------
       - name: Upload Safari project
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: J2TEAM-Safari-iOS-project
           path: build/safari/
+          if-no-files-found: warn
 
-      - name: Upload archive
-        if: success()
+      # ------------------------------------------------------------
+      # 14. Upload archive
+      # ------------------------------------------------------------
+      - name: Upload iOS archive
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: J2TEAM-Security-iOS-archive
           path: build/archive/
+          if-no-files-found: warn
